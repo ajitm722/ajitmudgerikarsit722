@@ -166,20 +166,22 @@ jobs:
         run: |
           kubectl create namespace "${NS}" || echo "namespace exists"
 
-      - name: Apply base manifests (Deployments + Services)
+      - name: Render manifests with ACR images (commit SHA)
         run: |
-          kubectl apply -n "${NS}" -f k8s/dbs.yaml
-          kubectl apply -n "${NS}" -f k8s/product.yaml
-          kubectl apply -n "${NS}" -f k8s/order.yaml
-          kubectl apply -n "${NS}" -f k8s/customer.yaml
-          kubectl apply -n "${NS}" -f k8s/frontend.yaml
+          mkdir -p k8s_rendered
+          ACR="${ACR_LOGIN_SERVER}"
+          SHA="${{ github.sha }}"
 
-      - name: Point images to ACR (this commit SHA)
+          for f in k8s/*.yaml; do
+            sed -e "s|REPLACE_ME|${ACR}|g" -e "s|TAG|${SHA}|g" "$f" > "k8s_rendered/$(basename "$f")"
+          done
+
+          echo "Rendered files:"
+          ls -l k8s_rendered
+
+      - name: Apply rendered manifests
         run: |
-          kubectl -n "${NS}" set image deploy/product  product="${ACR_LOGIN_SERVER}/product:${{ github.sha }}"
-          kubectl -n "${NS}" set image deploy/order    order="${ACR_LOGIN_SERVER}/order:${{ github.sha }}"
-          kubectl -n "${NS}" set image deploy/customer customer="${ACR_LOGIN_SERVER}/customer:${{ github.sha }}"
-          kubectl -n "${NS}" set image deploy/frontend frontend="${ACR_LOGIN_SERVER}/frontend:${{ github.sha }}"
+          kubectl apply -n "${NS}" -f k8s_rendered/
 
       - name: Wait for DBs ready
         run: |
