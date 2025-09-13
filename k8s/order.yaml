@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: order } }
+  template:
+    metadata: { labels: { app: order } }
+    spec:
+      containers:
+        - name: order
+          image: REPLACE_ME/order:TAG
+          env:
+            - { name: POSTGRES_HOST, value: "order-db" }
+            - { name: POSTGRES_DB, value: "orders" }
+            - { name: POSTGRES_USER, value: "postgres" }
+            - { name: POSTGRES_PASSWORD, value: "postgres" }
+            - { name: PRODUCT_SERVICE_URL, value: "http://product:8000" }
+          ports: [{ containerPort: 8000 }]
+          startupProbe:
+            httpGet: { path: "/", port: 8000 }
+            failureThreshold: 30 # 30*5s = 150s
+            periodSeconds: 5
+          readinessProbe:
+            httpGet: { path: "/", port: 8000 }
+            initialDelaySeconds: 20
+            periodSeconds: 5
+
+          livenessProbe:
+            httpGet: { path: "/", port: 8000 }
+            initialDelaySeconds: 40
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order
+spec:
+  selector: { app: order }
+  ports: [{ port: 8000, targetPort: 8000 }]
+  type: ClusterIP

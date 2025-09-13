@@ -42,7 +42,11 @@ logger.info(
     f"Order Service: Configured to communicate with Customer Service at: {CUSTOMER_SERVICE_URL}"
 )
 
-
+PRODUCT_SERVICE_URL: str = os.getenv(
+    "PRODUCT_SERVICE_URL",
+    # Default that works inside Compose (service-to-service DNS).
+    "http://product_service:8000",
+)
 # --- RabbitMQ Configuration ---
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))

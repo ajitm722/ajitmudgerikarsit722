@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-nginx-conf
+data:
+  default.conf: |
+    server {
+      listen 80;
+      server_name _;
+
+      root /usr/share/nginx/html;
+      index index.html;
+
+      location ~* \.(js|css|png|jpg|jpeg|gif|svg|ico)$ {
+        expires 1h;
+        access_log off;
+        try_files $uri =404;
+      }
+
+      location / {
+        try_files $uri /index.html;
+      }
+
+      # ---- K8s API Proxies (use Service names) ----
+      location /api/products/ {
+        proxy_pass http://product:8000/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+      }
+
+      location /api/orders/ {
+        proxy_pass http://order:8000/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+      }
+
+      location /api/customers/ {
+        proxy_pass http://customer:8000/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+      }
+
+      # Health endpoint for probes
+      location /healthz {
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+      }
+    }
+
