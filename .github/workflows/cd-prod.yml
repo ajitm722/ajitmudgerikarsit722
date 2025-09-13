@@ -1,0 +1,158 @@
+name: CD — production (main)
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Start compose for tests
+        run: docker compose up -d --build product_db order_db customer_db product_service
+      - name: Wait for Postgres
+        run: |
+          for c in product_db_container order_db_container customer_db_container; do
+            echo "Waiting for $c ..."
+            for i in {1..30}; do
+              if docker exec "$c" pg_isready -U postgres >/dev/null 2>&1; then
+                echo "$c is ready"
+                break
+              fi
+              sleep 2
+            done
+          done
+      - name: Install dev deps
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install -U pip
+          pip install -r backend/product_service/requirements-dev.txt
+          pip install -r backend/order_service/requirements-dev.txt
+          pip install -r backend/customer_service/requirements-dev.txt
+      - name: Test product
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: '5432'
+          POSTGRES_DB: products
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: |
+          source .venv/bin/activate
+          cd backend/product_service && pytest -q
+      - name: Test order
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: '5433'
+          POSTGRES_DB: orders
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          PRODUCT_SERVICE_URL: http://localhost:8000
+        run: |
+          source .venv/bin/activate
+          cd backend/order_service && pytest -q
+      - name: Test customer
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: '5434'
+          POSTGRES_DB: customers
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: |
+          source .venv/bin/activate
+          cd backend/customer_service && pytest -q
+      - name: Down compose
+        if: always()
+        run: docker compose down -v
+
+  build_and_push:
+    needs: tests
+    runs-on: ubuntu-latest
+    env:
+      ACR_NAME: ${{ vars.ACR_NAME || secrets.ACR_NAME }}
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER || secrets.ACR_LOGIN_SERVER }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Docker login to ACR
+        uses: azure/docker-login@v2
+        with:
+          login-server: ${{ env.ACR_LOGIN_SERVER }}
+          username: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
+          password: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientSecret }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build & push images
+        run: |
+          docker build -t "$ACR_LOGIN_SERVER/product:${{ github.sha }}"   ./backend/product_service
+          docker build -t "$ACR_LOGIN_SERVER/order:${{ github.sha }}"     ./backend/order_service
+          docker build -t "$ACR_LOGIN_SERVER/customer:${{ github.sha }}"  ./backend/customer_service
+          docker build -t "$ACR_LOGIN_SERVER/frontend:${{ github.sha }}"  ./frontend
+          docker push "$ACR_LOGIN_SERVER/product:${{ github.sha }}"
+          docker push "$ACR_LOGIN_SERVER/order:${{ github.sha }}"
+          docker push "$ACR_LOGIN_SERVER/customer:${{ github.sha }}"
+          docker push "$ACR_LOGIN_SERVER/frontend:${{ github.sha }}"
+
+  deploy_prod:
+    name: Deploy to prod namespace (AKS)
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    env:
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER || secrets.ACR_LOGIN_SERVER }}
+      AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP || secrets.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME || secrets.AKS_CLUSTER_NAME }}
+      NS: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      - name: Ensure prod namespace exists
+        run: kubectl create namespace "${NS}" || echo "namespace exists"
+
+      - name: Render manifests with prod images (commit SHA)
+        run: |
+          mkdir -p k8s_rendered
+          ACR="${ACR_LOGIN_SERVER}"
+          SHA="${{ github.sha }}"
+          for f in k8s/*.yaml; do
+            sed -e "s|REPLACE_ME|${ACR}|g" -e "s|TAG|${SHA}|g" "$f" > "k8s_rendered/$(basename "$f")"
+          done
+          ls -l k8s_rendered
+
+      - name: Apply manifests to prod
+        run: kubectl apply -n "${NS}" -f k8s_rendered/
+
+      - name: Wait for DBs
+        run: |
+          kubectl -n "${NS}" rollout status deploy/product-db --timeout=300s
+          kubectl -n "${NS}" rollout status deploy/order-db   --timeout=300s
+          kubectl -n "${NS}" rollout status deploy/customer-db --timeout=300s
+
+      - name: Wait for apps
+        run: |
+          kubectl -n "${NS}" rollout status deploy/product  --timeout=600s
+          kubectl -n "${NS}" rollout status deploy/order    --timeout=600s
+          kubectl -n "${NS}" rollout status deploy/customer --timeout=600s
+          kubectl -n "${NS}" rollout status deploy/frontend --timeout=600s
+
+      - name: Quick prod smoke (in-cluster)
+        run: |
+          kubectl -n "${NS}" run curl --image=curlimages/curl:8.10.1 --restart=Never -- \
+            sh -c 'set -e; curl -sf http://product:8000/ | head -c 120; echo; curl -sf http://order:8000/ | head -c 120; echo; curl -sf http://customer:8000/ | head -c 120; echo'
+          kubectl -n "${NS}" delete pod curl --wait=true
+
