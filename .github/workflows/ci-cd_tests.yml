@@ -187,6 +187,17 @@ jobs:
           kubectl -n "${NS}" rollout status deploy/order-db   --timeout=180s
           kubectl -n "${NS}" rollout status deploy/customer-db --timeout=180s
 
+      - name: Debug pods & events
+        if: always()
+        run: |
+          kubectl -n "${NS}" get pods -o wide
+          for a in product order customer frontend; do
+            echo "=== $a ==="
+            kubectl -n "${NS}" describe deploy/$a || true
+            kubectl -n "${NS}" get pods -l app=$a -o name | xargs -r -I{} sh -c 'echo "*** {}"; kubectl -n "${NS}" describe {}; kubectl -n "${NS}" logs --tail=200 {} || true'
+          done
+          kubectl -n "${NS}" get events --sort-by=.lastTimestamp | tail -n 200
+
       - name: Wait for apps ready
         run: |
           kubectl -n "${NS}" rollout status deploy/product  --timeout=300s
