@@ -90,6 +90,8 @@ jobs:
         run: docker compose down -v
 
   build_and_push:
+
+
     name: Build & push images to ACR
     needs: tests
     runs-on: ubuntu-latest
@@ -135,3 +137,76 @@ jobs:
         run: |
           docker build -t "$ACR_LOGIN_SERVER/frontend:${{ github.sha }}" ./frontend
           docker push "$ACR_LOGIN_SERVER/frontend:${{ github.sha }}"
+
+  deploy_staging:
+    name: Deploy to ephemeral staging (AKS)
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    env:
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER || secrets.ACR_LOGIN_SERVER }}
+      AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP || secrets.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME || secrets.AKS_CLUSTER_NAME }}
+      NS: stg-${{ github.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      - name: Create staging namespace
+        run: |
+          kubectl create namespace "${NS}" || echo "namespace exists"
+
+      - name: Apply base manifests (Deployments + Services)
+        run: |
+          kubectl apply -n "${NS}" -f k8s/dbs.yaml
+          kubectl apply -n "${NS}" -f k8s/product.yaml
+          kubectl apply -n "${NS}" -f k8s/order.yaml
+          kubectl apply -n "${NS}" -f k8s/customer.yaml
+          kubectl apply -n "${NS}" -f k8s/frontend.yaml
+
+      - name: Point images to ACR (this commit SHA)
+        run: |
+          kubectl -n "${NS}" set image deploy/product  product="${ACR_LOGIN_SERVER}/product:${{ github.sha }}"
+          kubectl -n "${NS}" set image deploy/order    order="${ACR_LOGIN_SERVER}/order:${{ github.sha }}"
+          kubectl -n "${NS}" set image deploy/customer customer="${ACR_LOGIN_SERVER}/customer:${{ github.sha }}"
+          kubectl -n "${NS}" set image deploy/frontend frontend="${ACR_LOGIN_SERVER}/frontend:${{ github.sha }}"
+
+      - name: Wait for DBs ready
+        run: |
+          kubectl -n "${NS}" rollout status deploy/product-db --timeout=180s
+          kubectl -n "${NS}" rollout status deploy/order-db   --timeout=180s
+          kubectl -n "${NS}" rollout status deploy/customer-db --timeout=180s
+
+      - name: Wait for apps ready
+        run: |
+          kubectl -n "${NS}" rollout status deploy/product  --timeout=300s
+          kubectl -n "${NS}" rollout status deploy/order    --timeout=300s
+          kubectl -n "${NS}" rollout status deploy/customer --timeout=300s
+          kubectl -n "${NS}" rollout status deploy/frontend --timeout=300s
+
+      - name: Smoke test (in-cluster curl pod)
+        run: |
+          kubectl -n "${NS}" run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- \
+            sh -c '
+              set -e
+              echo "Hit product root:";   curl -sf http://product:8000/   | head -c 200; echo
+              echo "Hit order root:";     curl -sf http://order:8000/     | head -c 200; echo
+              echo "Hit customer root:";  curl -sf http://customer:8000/  | head -c 200; echo
+            '
+          # Cleanup the curl pod
+          kubectl -n "${NS}" delete pod curl --wait=true
+
+      - name: Cleanup staging namespace (always)
+        if: always()
+        run: |
+          kubectl delete namespace "${NS}" --ignore-not-found=true --wait=false
